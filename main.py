@@ -1,6 +1,7 @@
 import os
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+import requests
 
 app = FastAPI()
 
@@ -63,6 +64,85 @@ def test_database():
     response["database_name"] = "✅ Set" if os.getenv("DATABASE_NAME") else "❌ Not Set"
     
     return response
+
+
+def _search_itunes(term: str, limit: int = 20):
+    url = "https://itunes.apple.com/search"
+    params = {"term": term, "media": "music", "entity": "song", "limit": limit}
+    r = requests.get(url, params=params, timeout=10)
+    r.raise_for_status()
+    return r.json().get("results", [])
+
+
+def _lookup_similar_by_artist(artist: str, exclude_track_id: int | None = None, limit: int = 12):
+    results = _search_itunes(artist, limit=50)
+    items = []
+    seen = set()
+    for it in results:
+        if it.get("kind") != "song":
+            continue
+        track_id = it.get("trackId")
+        if exclude_track_id and track_id == exclude_track_id:
+            continue
+        key = (it.get("trackName"), it.get("artistName"))
+        if key in seen:
+            continue
+        seen.add(key)
+        items.append(it)
+        if len(items) >= limit:
+            break
+    return items
+
+
+@app.get("/api/similar")
+def get_similar_songs(song: str = Query(..., description="Song name to find similar tracks for")):
+    # Step 1: find the seed track
+    seed_results = _search_itunes(song, limit=25)
+    seed = None
+    for it in seed_results:
+        if it.get("kind") == "song":
+            seed = it
+            break
+    if not seed:
+        raise HTTPException(status_code=404, detail="Song not found. Try a different name.")
+
+    artist = seed.get("artistName")
+    track_id = seed.get("trackId")
+
+    # Step 2: fetch more by same artist as a simple, keyless heuristic
+    similar = _lookup_similar_by_artist(artist, exclude_track_id=track_id, limit=16)
+
+    # If too few, broaden by including the seed term again (captures covers/remixes)
+    if len(similar) < 8:
+        extra = _search_itunes(song, limit=50)
+        for it in extra:
+            if it.get("kind") != "song":
+                continue
+            if it.get("trackId") == track_id:
+                continue
+            key = (it.get("trackName"), it.get("artistName"))
+            if all((it.get("trackName"), it.get("artistName")) != (x.get("trackName"), x.get("artistName")) for x in similar):
+                similar.append(it)
+            if len(similar) >= 16:
+                break
+
+    # Shape response
+    def map_item(it):
+        return {
+            "trackId": it.get("trackId"),
+            "trackName": it.get("trackName"),
+            "artistName": it.get("artistName"),
+            "collectionName": it.get("collectionName"),
+            "artworkUrl100": it.get("artworkUrl100"),
+            "previewUrl": it.get("previewUrl"),
+            "trackViewUrl": it.get("trackViewUrl"),
+        }
+
+    payload = {
+        "seed": map_item(seed),
+        "similar": [map_item(x) for x in similar[:16]],
+    }
+    return payload
 
 
 if __name__ == "__main__":
